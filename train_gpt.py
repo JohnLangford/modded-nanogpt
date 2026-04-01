@@ -209,6 +209,28 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
     return X
 
 
+def sinkhorn(X: torch.Tensor, num_iters: int = 5, eps: float = 1e-8, normalize: bool = True) -> torch.Tensor:
+    """SR-Sinkhorn normalization (arxiv:2502.06742): alternating L2 row/column normalization.
+    If normalize=True, rescale output to Frobenius norm = sqrt(min(m,n)) to match Polar Express scale."""
+    import math
+    m, n = X.shape[-2], X.shape[-1]
+    for _ in range(num_iters):
+        row_norms = X.norm(dim=-1, keepdim=True).clamp(min=eps)
+        X = X * (math.sqrt(n) / row_norms)
+        col_norms = X.norm(dim=-2, keepdim=True).clamp(min=eps)
+        X = X * (math.sqrt(m) / col_norms)
+    if normalize:
+        # Rescale to match Polar Express/Newton-Schulz Frobenius norm: sqrt(min(m, n))
+        target_norm = math.sqrt(min(m, n))
+        actual_norm = X.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)
+        X = X * (target_norm / actual_norm)
+    return X
+
+# ARO config: override normuon LR, momentum, and sinkhorn normalization via env vars
+_aro_lr = float(os.environ["ARO_LR"]) if os.environ.get("ARO_LR") else None
+_aro_momentum = float(os.environ["ARO_MOMENTUM"]) if os.environ.get("ARO_MOMENTUM") else None
+_aro_normalize = os.environ.get("ARO_NORMALIZE", "1") != "0"  # default: normalize on
+
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
 
@@ -415,20 +437,16 @@ class NorMuonAndAdam:
 
             elif p_cfg.optim == "normuon":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
+                m = chunk_shape[-2]
 
                 # Momentum buffer (FP32 for precision)
                 momentum_buffer = torch.zeros(
                     chunk_shape, dtype=torch.float32, device=param.device
                 )
 
-                # Second momentum buffer - reduced along one dimension
-                if chunk_shape[-2] >= chunk_shape[-1]:
-                    second_mom_shape = (*chunk_shape[:-1], 1)
-                else:
-                    second_mom_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
-                second_momentum_buffer = torch.zeros(
-                    second_mom_shape, dtype=torch.float32, device=param.device
-                )
+                # ARO rotation matrix R per matrix in chunk, shape (chunk_size, m, m), float32
+                # Initialized to identity
+                rotation = torch.eye(m, dtype=torch.float32, device=param.device).unsqueeze(0).expand(p_cfg.chunk_size, -1, -1).contiguous()
 
                 # Mantissa buffer for precision tracking
                 mantissa = torch.zeros(
@@ -437,7 +455,7 @@ class NorMuonAndAdam:
 
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
-                    second_momentum_buffer=second_momentum_buffer,
+                    rotation=rotation,
                     mantissa=mantissa,
                 )
 
@@ -502,7 +520,9 @@ class NorMuonAndAdam:
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
-                p_state["second_momentum_buffer"].zero_()
+                # Reset ARO rotation to identity
+                m = p_state["rotation"].shape[-1]
+                p_state["rotation"].copy_(torch.eye(m, dtype=torch.float32, device=p_state["rotation"].device).unsqueeze(0).expand_as(p_state["rotation"]))
 
     def copy_lm_state_to_embed(self):
         """
@@ -708,29 +728,38 @@ class NorMuonAndAdam:
     # NorMuon update
 
     def _normuon_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
-        """Apply NorMuon update to a parameter. Returns the updated p_slice."""
-        chunk_shape = grad_chunk.shape
-
+        """Apply ARO (Adaptively Rotated Optimization) update with sinkhorn f().
+        Replaces NorMuon's Polar Express + variance reduction with ARO's
+        rotation-based update (arxiv:2602.09006, microsoft/dion PR #36)."""
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
-        # Momentum update
+        # Momentum update (EMA)
         momentum_buffer = p_state["momentum_buffer"]
         momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
-        updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
+        M = momentum_buffer.float()
 
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        # ARO update: rotation + sinkhorn
+        R = p_state["rotation"]  # (chunk_size, m, m), float32
 
-        # Variance reduction
-        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
-        )
+        # Phase 1: rotate momentum into previous frame, apply f()
+        rotated = R.mT @ M               # R^T @ M
+        f_rotated = sinkhorn(rotated, normalize=_aro_normalize)
+
+        # Phase 2: cross-alignment + QR -> new rotation
+        cross = M @ f_rotated.mT          # M @ f(R^T @ M)^T, shape (chunk_size, m, m)
+        Q, _ = torch.linalg.qr(cross)     # QR on GPU (H100 cusolver is fine)
+
+        # Phase 3: rotate with new R, apply f() -> update direction
+        rotated_new = Q.mT @ M            # Q^T @ M
+        f_new = sinkhorn(rotated_new, normalize=_aro_normalize)
+        v_chunk = (Q @ f_new).bfloat16()  # U = Q @ f(Q^T @ M)
+
+        # Store new rotation
+        R.copy_(Q)
 
         # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
@@ -1578,8 +1607,8 @@ class TrainingManager():
         )
 
         normuon_defaults = dict(
-            lr=0.023,
-            momentum=0.95,
+            lr=_aro_lr if _aro_lr is not None else 0.023,
+            momentum=_aro_momentum if _aro_momentum is not None else 0.95,
             beta2=0.95,
             weight_decay=1.2,
         )
