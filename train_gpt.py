@@ -210,6 +210,14 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 
 # -----------------------------------------------------------------------------
+# Skip Update + Magma config (dion PR #35: https://github.com/microsoft/dion/pull/35)
+# SkipUpdate: https://arxiv.org/abs/2602.15322
+skip_update_prob = float(os.environ["SKIP_UPDATE_PROB"]) if os.environ.get("SKIP_UPDATE_PROB") else None
+magma_tau = float(os.environ["MAGMA_TAU"]) if os.environ.get("MAGMA_TAU") else None
+if magma_tau is not None and skip_update_prob is None:
+    raise ValueError("magma_tau requires skip_update_prob to be set")
+
+# -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
 
 @dataclass
@@ -435,10 +443,16 @@ class NorMuonAndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
+                # Per-matrix magma scale EMA buffer for skip_update + magma
+                magma_scale = torch.full(
+                    (p_cfg.chunk_size,), 0.5, dtype=torch.float32, device=param.device
+                )
+
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
+                    magma_scale=magma_scale,
                 )
 
     # -----------------------------------
@@ -503,6 +517,7 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                p_state["magma_scale"].fill_(0.5)
 
     def copy_lm_state_to_embed(self):
         """
@@ -714,6 +729,11 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
+        # Snapshot momentum and gradient before update (needed for magma cosine similarity)
+        if magma_tau is not None:
+            momentum_before = p_state["momentum_buffer"].clone()
+            grad_chunk_orig = grad_chunk.clone()
+
         # Momentum update
         momentum_buffer = p_state["momentum_buffer"]
         momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
@@ -731,6 +751,24 @@ class NorMuonAndAdam:
         v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
             v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
+
+        # Skip Update + Magma (dion PR #35)
+        if skip_update_prob is not None and skip_update_prob < 1.0:
+            keep = torch.bernoulli(torch.full(
+                (v_chunk.size(0), 1, 1), skip_update_prob,
+                device=v_chunk.device, dtype=v_chunk.dtype
+            ))
+            if magma_tau is not None:
+                magma_s = p_state["magma_scale"]
+                M_flat = momentum_before.flatten(1).float()
+                G_flat = grad_chunk_orig.flatten(1).float()
+                cos = (M_flat * G_flat).sum(dim=1) / (M_flat.norm(dim=1) * G_flat.norm(dim=1) + 1e-8)
+                e_tilde = torch.sigmoid(cos / magma_tau)
+                magma_s.mul_(0.9).add_(e_tilde, alpha=0.1)
+                scale = magma_s.view(-1, 1, 1).type_as(v_chunk)
+            else:
+                scale = 1.0 / skip_update_prob
+            v_chunk = v_chunk * (keep * scale)
 
         # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
